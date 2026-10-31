@@ -1,0 +1,1 @@
+export default()=>({name:'Sales Agent',short_name:'Agent',start_url:'/',display:'standalone',background_color:'#ffffff',theme_color:'#ffffff'})

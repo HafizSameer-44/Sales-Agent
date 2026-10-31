@@ -1,0 +1,12 @@
+# My business (FILL THIS IN. The agent is only as good as this file)
+- My name and role:
+- Company:
+- What I sell in one sentence:
+- Who it's for:
+- Main problem it solves:
+- Price (or "escalate pricing to me"):
+- Real proof / case studies (client type, before, after, timeframe):
+- Booking link:
+- How I write (paste 5 real emails/DMs I've sent):
+- Words I never use:
+- Not a fit:

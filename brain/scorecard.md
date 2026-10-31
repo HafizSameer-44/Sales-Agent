@@ -1,0 +1,3 @@
+# Sales call scorecard (100). Quote the moment that justifies each score.
+Agenda in first 3 min (10); discovery with open questions (15); pain quantified (10); budget discussed before offer (10); decision process (10); seller talks 45% or less (10); tailored offer in their words (10); objections handled with a question (10); clear next step booked (10); energy and rapport (5).
+Verdict: Weak, Okay, Strong or Excellent. Give 3 bullet summary, 3 things done well, 3 fixes each with an exact sentence to say instead, a follow-up email draft, and deal stage (discovery, proposal, negotiation, won, lost).
