@@ -1,35 +1,32 @@
 // ============================================================================
-// AI LEAD FINDER API  v2  (single file)  -  finds businesses WITHOUT a website
+// AI LEAD FINDER API  v3   -  businesses WITHOUT a website, with phone, email (when it exists) and Google Maps link
 // REPLACE the file:  app/api/leadfinder/route.js
-// Needs your existing lib/db.js (db, ok, auth, J) and lib/llm.js (ask, brain). No new key, no SQL.
+// Needs your existing lib/db.js (db, ok, auth, J) and lib/llm.js (ask, brain). No SQL needed.
 //
-// Data sources: Geoapify (free key GEOAPIFY_KEY, most reliable) first, then 4 free OpenStreetMap servers raced as backup.
-//   - if every source fails, the error shows the exact reasons
-//   - no geocoder: city coordinates are built in (one less thing that can fail)
-//   - results are cached in your Supabase "settings" table, so repeat searches are instant
-//   - no website scraping and no AI call during search, so a search takes seconds
-//   - AI is used only when you press "Write email / Write message"
+// API keys are read from your .env.local (and Vercel env vars) - never paste a key into code.
+// DATA SOURCES (add at least one key in .env.local and Vercel, then restart/redeploy):
+//   APIFY_TOKEN=...      Google Maps data via Apify. Best quality: real Google listings with "no website", phone, reviews, map URL.
+//                        Free plan: $5 credit every month (apify.com -> Settings -> API & integrations).
+//   GEOAPIFY_KEY=...     Free backup (geoapify.com, no card). Map data (OpenStreetMap based). Contact details are sparser.
+//   APIFY_ACTOR=...      optional, default compass~crawler-google-places
+// The unreliable public Overpass servers are NOT used any more.
 // ============================================================================
-import {db, ok, auth, J} from '@/lib/db';
+import {db, ok, auth, J, notify} from '@/lib/db';
 import {ask, brain} from '@/lib/llm';
 
 export const maxDuration = 60;
-const UA = {'User-Agent': 'lead-finder/2.0 (' + (process.env.GMAIL_USER || 'contact') + ')', 'Content-Type': 'application/x-www-form-urlencoded'};
-const MIRRORS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-  'https://overpass.private.coffee/api/interpreter',
-  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
-];
-const RADIUS = 6000; // meters around the city centre
-const OSM = {
-  'Real estate': 'office=estate_agent', 'Dentist': 'amenity=dentist', 'Lawyer': 'office=lawyer',
-  'Accountant': 'office=accountant', 'Marketing agency': 'office=advertising_agency',
-  'IT / Software company': 'office=it', 'Hotel': 'tourism=hotel', 'Clinic': 'amenity=clinic',
-  'Restaurant': 'amenity=restaurant', 'Gym': 'leisure=fitness_centre', 'Beauty salon': 'shop=hairdresser',
-  'Travel agency': 'shop=travel_agency', 'Pharmacy': 'amenity=pharmacy', 'School': 'amenity=school',
-  'Cafe': 'amenity=cafe', 'Car dealer': 'shop=car', 'Insurance': 'office=insurance',
-  'Car repair': 'shop=car_repair', 'Bakery': 'shop=bakery', 'Florist': 'shop=florist',
+const RADIUS = 6000; // meters around the city centre (Geoapify)
+const APIFY = 'https://api.apify.com/v2';
+const ACTOR = process.env.APIFY_ACTOR || 'compass~crawler-google-places';
+
+// Industry -> Geoapify categories (Apify accepts any industry text)
+const GEO = {
+  'Real estate': 'office.estate_agent,service.estate_agent', 'Dentist': 'healthcare.dentist', 'Lawyer': 'office.lawyer',
+  'Accountant': 'office.accountant', 'Marketing agency': 'office.advertising_agency', 'IT / Software company': 'office.it',
+  'Hotel': 'accommodation.hotel,accommodation.guest_house', 'Clinic': 'healthcare.clinic_or_praxis', 'Restaurant': 'catering.restaurant',
+  'Gym': 'sport.fitness', 'Beauty salon': 'service.beauty', 'Travel agency': 'service.travel_agency,office.travel_agent',
+  'Pharmacy': 'healthcare.pharmacy', 'School': 'education.school', 'Cafe': 'catering.cafe', 'Car dealer': 'commercial.vehicle',
+  'Insurance': 'office.insurance', 'Car repair': 'service.vehicle.repair.car', 'Bakery': 'commercial.food_and_drink.bakery', 'Florist': 'commercial.florist',
 };
 const CITIES = {
   'United States': {'New York': [40.7128, -74.006], 'Los Angeles': [34.0522, -118.2437], 'Chicago': [41.8781, -87.6298], 'Houston': [29.7604, -95.3698], 'Miami': [25.7617, -80.1918], 'Austin': [30.2672, -97.7431], 'Seattle': [47.6062, -122.3321], 'San Francisco': [37.7749, -122.4194], 'Boston': [42.3601, -71.0589], 'Dallas': [32.7767, -96.797]},
@@ -52,210 +49,196 @@ const CITIES = {
   'Pakistan': {'Karachi': [24.8607, 67.0011], 'Lahore': [31.5204, 74.3587], 'Islamabad': [33.6844, 73.0479]},
 };
 
+const mapsSearch = (name, addr) => 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent((name + ' ' + (addr || '')).trim());
+const friendly = m => /hard limit|usage limit|exceeded|payment|402/i.test(m)
+  ? 'Your Apify credit for this month is finished. Wait for the monthly reset or add credit in Apify.'
+  : /\b(401|403)\b|unauthor|invalid token|user was not found/i.test(m)
+    ? 'The API key was rejected. Check APIFY_TOKEN or GEOAPIFY_KEY in your environment variables, then restart.'
+    : m;
+
 export async function GET(r) {
   if (!auth(r)) return J({}, 401);
-  return J({apify: !!process.env.APIFY_TOKEN, niches: Object.keys(OSM), countries: Object.fromEntries(Object.entries(CITIES).map(([k, v]) => [k, Object.keys(v)]))});
+  return J({
+    apify: !!process.env.APIFY_TOKEN, geo: !!process.env.GEOAPIFY_KEY, niches: Object.keys(GEO),
+    countries: Object.fromEntries(Object.entries(CITIES).map(([k, v]) => [k, Object.keys(v)])),
+  });
 }
 
 export async function POST(r) {
   if (!auth(r)) return J({}, 401);
   try {
     const b = await r.json();
-    if (b.action === 'search') return J(await search(b));
-    if (b.action === 'apify_start') return J(await apifyStart(b));
-    if (b.action === 'apify_status') return J(await apifyStatus(b));
-    if (b.action === 'apify_import') return J(await apifyImport(b));
-    if (b.action === 'draft') return J(await draft(b));
-    if (b.action === 'mark') {
-      await db.from('leads').update({stage: 'messaged', last_contact: new Date().toISOString()}).eq('id', b.lead_id);
-      return J({ok: 1});
-    }
-    return J({error: 'unknown action'}, 400);
-  } catch (e) { return J({error: e.message}, 500); }
+    const act = {search, apify_start: apifyStart, apify_status: apifyStatus, apify_import: apifyImport, check, draft, mark, add_lead: addLead, delete_leads: delLeads}[b.action];
+    if (!act) return J({error: 'Unknown action'}, 400);
+    return J(await act(b));
+  } catch (e) { return J({error: friendly(e.message || 'Something went wrong')}, 500); }
 }
 
-// ---------- map data: Geoapify (free key, reliable) -> OpenStreetMap servers (backup), cached ----------
-const GEO = {
-  'Real estate': 'office.estate_agent,service.estate_agent', 'Dentist': 'healthcare.dentist', 'Lawyer': 'office.lawyer',
-  'Accountant': 'office.accountant', 'Marketing agency': 'office.advertising_agency', 'IT / Software company': 'office.it',
-  'Hotel': 'accommodation.hotel,accommodation.guest_house', 'Clinic': 'healthcare.clinic_or_praxis', 'Restaurant': 'catering.restaurant',
-  'Gym': 'sport.fitness', 'Beauty salon': 'service.beauty', 'Travel agency': 'service.travel_agency,office.travel_agent',
-  'Pharmacy': 'healthcare.pharmacy', 'School': 'education.school', 'Cafe': 'catering.cafe', 'Car dealer': 'commercial.vehicle',
-  'Insurance': 'office.insurance', 'Car repair': 'service.vehicle.repair.car', 'Bakery': 'commercial.food_and_drink.bakery', 'Florist': 'commercial.florist',
-};
-
-async function geoItems(niche, country, city, lat, lon) {
-  const cats = GEO[niche];
-  if (!process.env.GEOAPIFY_KEY || !cats) return null; // not configured or custom industry
-  const r = await fetch(`https://api.geoapify.com/v2/places?categories=${cats}&filter=circle:${lon},${lat},${RADIUS}&limit=500&apiKey=${process.env.GEOAPIFY_KEY}`, {signal: AbortSignal.timeout(20000)});
-  if (!r.ok) throw new Error('Geoapify ' + r.status + (r.status === 401 || r.status === 403 ? ' (check GEOAPIFY_KEY)' : ''));
-  const out = [];
-  for (const f of (await r.json()).features || []) {
-    const p = f.properties || {}, raw = p.datasource?.raw || {};
-    if (!p.name || p.website || p.contact?.website || raw.website || raw['contact:website'] || raw.url) continue; // has a website -> skip
-    const phone = p.contact?.phone || p.phone || raw.phone || raw['contact:phone'] || '';
-    const email = (p.contact?.email || p.email || raw.email || raw['contact:email'] || '').toLowerCase();
-    if (!phone && !email) continue;
-    out.push({
-      name: p.name, phone, email, address: p.address_line2 || p.formatted || city,
-      social: raw['contact:facebook'] || raw['contact:instagram'] || raw.facebook || '',
-      hours: !!(p.opening_hours || raw.opening_hours), street: !!p.street, city, country, niche,
-    });
-  }
-  return out;
-}
-
-async function overpass(q) {
-  let last = [];
-  for (let round = 0; round < 1; round++) {
-    try {
-      return await Promise.any(MIRRORS.map(async u => {
-        const r = await fetch(u, {method: 'POST', headers: UA, body: 'data=' + encodeURIComponent(q), signal: AbortSignal.timeout(28000)});
-        if (!r.ok) throw new Error(new URL(u).hostname + ' status ' + r.status);
-        const j = await r.json();
-        if (!Array.isArray(j.elements)) throw new Error(new URL(u).hostname + ' bad response');
-        return j.elements;
-      }));
-    } catch (e) {
-      last = (e.errors || [e]).map(x => x.name === 'TimeoutError' ? 'timeout' : x.message);
-      await new Promise(res => setTimeout(res, 1500));
-    }
-  }
-  throw new Error('OpenStreetMap servers failed (' + [...new Set(last)].slice(0, 3).join(', ') + ')');
-}
-
-async function osmItems(niche, country, city, lat, lon) {
-  const tag = OSM[niche];
-  const f = tag ? `["${tag.split('=')[0]}"="${tag.split('=')[1]}"]` : `["name"~"${String(niche).replace(/["\\]/g, '')}",i]`;
-  const no = '[!"website"][!"contact:website"][!"url"]';
-  const a = `(around:${RADIUS},${lat},${lon})`;
-  const els = await overpass(`[out:json][timeout:20];(nwr${f}${no}["phone"]${a};nwr${f}${no}["contact:phone"]${a};nwr${f}${no}["email"]${a};nwr${f}${no}["contact:email"]${a};);out tags 200;`);
-  const seen = new Set(), items = [];
-  for (const el of els) {
-    const t = el.tags || {};
-    if (!t.name || seen.has(t.name.toLowerCase())) continue;
-    seen.add(t.name.toLowerCase());
-    items.push({
-      name: t.name, phone: t.phone || t['contact:phone'] || '', email: (t.email || t['contact:email'] || '').toLowerCase(),
-      address: [t['addr:housenumber'], t['addr:street'], t['addr:city'] || city].filter(Boolean).join(' '),
-      social: t['contact:facebook'] || t['contact:instagram'] || t.facebook || '', hours: !!t.opening_hours, street: !!t['addr:street'],
-      city, country, niche,
-    });
-  }
-  return items;
-}
-
-async function pool(niche, country, city, force) {
-  const key = 'pool_' + (niche + '_' + city).replace(/\W/g, '');
-  const row = (await db.from('settings').select('value').eq('key', key).maybeSingle()).data?.value;
-  let cached = null;
-  try { cached = row && JSON.parse(row); } catch { /* ignore */ }
-  if (!force && cached?.items?.length && Date.now() - cached.t < 6048e5) return cached.items;
-  const [lat, lon] = CITIES[country][city];
-  const errs = [];
-  let items = null, geoOk = false;
-  try { items = await geoItems(niche, country, city, lat, lon); geoOk = items !== null; } catch (e) { errs.push(e.message); }
-  if (!items?.length) {
-    try { items = await osmItems(niche, country, city, lat, lon); }
-    catch (e) { errs.push(e.message); if (geoOk) items = []; else items = null; }
-  }
-  if (items === null) {
-    if (cached?.items?.length) return cached.items; // stale cache is better than an error
-    throw new Error('Could not load business data. ' + errs.join(' | ') + '. FIX: add a free GEOAPIFY_KEY (myprojects.geoapify.com, no card) to your env variables and restart. It is far more reliable than the public map servers.');
-  }
-  if (items.length) await db.from('settings').upsert({key, value: JSON.stringify({t: Date.now(), items: items.slice(0, 200)})});
-  return items;
-}
-
-// ---------- search: no website, rule-based score, saved instantly -----------
-const score = c => Math.min(98, 55 + (c.phone ? 15 : 0) + (c.email ? 15 : 0) + (c.street ? 5 : 0) + (c.hours ? 4 : 0) + (c.social ? 4 : 0) + (c.reviews >= 20 ? 4 : 0) + (c.rating >= 4 ? 3 : 0));
-const why = c => ['No website', c.phone && 'phone available', c.email && 'email available', c.reviews && c.reviews + ' Google reviews', c.social && 'has a social page'].filter(Boolean).join(' · ');
+// ---------- scoring + saving (shared) ---------------------------------------
+const SOCIAL = /(facebook|instagram|linktr\.ee|wa\.me|tiktok|youtube|twitter|x\.com|linkedin|business\.site)/i;
+const noSite = c => !c.site || SOCIAL.test(c.site); // no website, or only a social page
+const score = c => Math.min(99, 50 + (noSite(c) ? 10 : 0) + (c.phone ? 15 : 0) + (c.email ? 20 : 0) + (c.street ? 5 : 0) + (c.hours ? 3 : 0) + (c.reviews >= 20 ? 4 : 0) + (c.rating >= 4 ? 3 : 0));
+const why = c => [!c.site ? 'No website' : noSite(c) ? 'Social page only' : 'Has website', c.phone && 'phone', c.email && 'email', c.reviews && c.reviews + ' Google reviews'].filter(Boolean).join(' · ');
 
 async function unsaved(items) {
-  const names = items.map(i => i.name), have = new Set();
+  const have = new Set(), emails = new Set();
+  const names = items.map(i => i.name);
   for (let i = 0; i < names.length; i += 40) {
-    const r = await db.from('leads').select('company').in('company', names.slice(i, i + 40));
-    (r.data || []).forEach(x => have.add(x.company));
+    const r = await db.from('leads').select('company,email').in('company', names.slice(i, i + 40));
+    (r.data || []).forEach(x => { have.add(x.company); if (x.email) emails.add(x.email); });
   }
-  return items.filter(i => !have.has(i.name));
-}
-async function gather(niche, country, names, force) {
-  const res = await Promise.allSettled(names.map(c => pool(niche, country, c, force)));
-  const items = res.flatMap(x => x.status === 'fulfilled' ? x.value : []);
-  if (!items.length) { const bad = res.find(x => x.status === 'rejected'); if (bad) throw bad.reason; }
-  return items;
-}
-
-async function search({niche, country, city, count}) {
-  const C = CITIES[country];
-  if (!C) throw new Error('Unknown country');
-  if (!niche) throw new Error('Choose an industry');
-  count = Math.min(+count || 20, 50);
-  const names = city && C[city] ? [city] : Object.keys(C).sort(() => Math.random() - 0.5).slice(0, 3);
-  let fresh = await unsaved(await gather(niche, country, names, false));
-  if (fresh.length < count) fresh = await unsaved(await gather(niche, country, names, true).catch(() => fresh));
-  return save(fresh, niche, country, count, names);
+  return items.filter(i => !have.has(i.name) && !(i.email && emails.has(i.email)));
 }
 
 async function save(fresh, niche, country, count, names) {
-  fresh.sort((a, b) => score(b) - score(a));
+  // order: no website first, then has email, then score
+  fresh.sort((a, b) => (noSite(b) ? 1 : 0) - (noSite(a) ? 1 : 0) || (b.email ? 1 : 0) - (a.email ? 1 : 0) || score(b) - score(a));
   const pick = fresh.slice(0, count);
   if (!pick.length) return {leads: [], pool: 0, cities: names};
   const rows = pick.map(c => ({
-    name: c.name, email: c.email || null, company: c.name, score: score(c), signals: ['No website', niche], explanation: why(c), stage: 'new',
-    profile: `Category: ${niche}\nLocation: ${c.address || c.city}, ${country}\nWebsite: none\nPhone: ${c.phone}${c.social ? '\nSocial: ' + c.social : ''}${c.maps ? '\nMaps: ' + c.maps : ''}`,
+    name: c.name, email: c.email || null, company: c.name, score: score(c), signals: noSite(c) ? ['Finder', 'No website', niche] : ['Finder', niche], explanation: why(c), stage: 'new',
+    profile: `Category: ${niche}\nLocation: ${c.address || c.city}, ${country}\nWebsite: ${c.site || 'none'}\nPhone: ${c.phone}\nMaps: ${c.maps || mapsSearch(c.name, c.address || c.city)}`,
   }));
   let saved = [];
   const bulk = await db.from('leads').insert(rows).select();
   if (!bulk.error) saved = bulk.data;
-  else for (const r of rows) { const x = await db.from('leads').insert(r).select().single(); if (!x.error) saved.push(x.data); }
-  const by = Object.fromEntries(pick.map(c => [c.name, c]));
-  const leads = saved.map(l => ({...l, phone: by[l.name]?.phone || '', address: by[l.name]?.address || '', country, social: by[l.name]?.social || '', maps: by[l.name]?.maps || ''}));
-  return {leads, pool: fresh.length, cities: names};
+  else for (const row of rows) { const x = await db.from('leads').insert(row).select().single(); if (!x.error) saved.push(x.data); }
+  if (saved.length) await notify(`Lead finder: ${saved.length} new leads (${saved.filter(l => l.email).length} with email, ${pick.filter(noSite).length} without a website)`);
+  return {leads: saved, pool: fresh.length, cities: names};
 }
 
-// ---------- Apify Google Maps (best quality, needs APIFY_TOKEN) -------------
-// The UI starts a run, checks its status every 4 seconds, then imports. No request ever runs long.
-const APIFY = 'https://api.apify.com/v2';
-const ACTOR = process.env.APIFY_ACTOR || 'compass~crawler-google-places';
-async function apifyStart({niche, country, city, count}) {
+// ---------- SOURCE 1: Apify Google Maps (UI starts a run, polls, then imports) --
+async function apifyStart({niche, country, city, count, mode}) {
   if (!process.env.APIFY_TOKEN) throw new Error('APIFY_TOKEN is not set');
   const C = CITIES[country];
   if (!C) throw new Error('Unknown country');
+  if (!niche) throw new Error('Choose an industry');
   const list = Object.keys(C);
   const c = city && C[city] ? city : list[Math.floor(Math.random() * list.length)];
   const r = await fetch(`${APIFY}/acts/${ACTOR}/runs?token=${process.env.APIFY_TOKEN}`, {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({searchStringsArray: [String(niche).toLowerCase()], locationQuery: `${c}, ${country}`, maxCrawledPlacesPerSearch: Math.min((+count || 20) * 3, 150), language: 'en', website: 'withoutWebsite', skipClosedPlaces: true}),
+    body: JSON.stringify({searchStringsArray: [String(niche).toLowerCase()], locationQuery: `${c}, ${country}`, maxCrawledPlacesPerSearch: Math.min((+count || 20) * 3, 150), language: 'en', skipClosedPlaces: true, ...(mode === 'strict' ? {website: 'withoutWebsite'} : {website: 'allPlaces', scrapeContacts: true})}),
   });
-  const j = await r.json();
-  if (!r.ok) throw new Error('Apify: ' + (j.error?.message || r.status));
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error('Apify ' + r.status + ': ' + (j.error?.message || 'could not start'));
   return {runId: j.data.id, datasetId: j.data.defaultDatasetId, city: c};
 }
 async function apifyStatus({runId}) {
   const r = await fetch(`${APIFY}/actor-runs/${runId}?token=${process.env.APIFY_TOKEN}`);
-  const j = await r.json();
-  if (!r.ok) throw new Error('Apify: ' + (j.error?.message || r.status));
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error('Apify ' + r.status + ': ' + (j.error?.message || 'status check failed'));
   return {status: j.data.status};
 }
-async function apifyImport({datasetId, niche, country, count}) {
+async function apifyImport({datasetId, niche, country, count, mode}) {
   const r = await fetch(`${APIFY}/datasets/${datasetId}/items?token=${process.env.APIFY_TOKEN}&clean=true&limit=300`);
-  const items = await r.json();
+  const items = await r.json().catch(() => null);
   if (!Array.isArray(items)) throw new Error('Apify returned no data');
   const cands = [], seen = new Set();
   for (const p of items) {
-    if (!p.title || p.website || seen.has(p.title.toLowerCase())) continue; // skip anything that has a website
-    const phone = p.phoneUnformatted || p.phone || '', email = (p.emails?.[0] || '').toLowerCase();
+    if (!p.title || seen.has(p.title.toLowerCase())) continue;
+    const site = String(p.website || '');
+    if (mode === 'strict' && site) continue; // strict: never keep a place that has a website
+    const phone = p.phoneUnformatted || p.phone || '';
+    const email = [].concat(p.emails || []).map(String).find(x => x.includes('@'))?.toLowerCase() || '';
     if (!phone && !email) continue;
     seen.add(p.title.toLowerCase());
-    cands.push({name: p.title, phone, email, address: p.address || p.city || '', social: '', hours: !!p.openingHours?.length, street: !!(p.street || p.address),
+    cands.push({name: p.title, site, phone, email, address: p.address || p.city || '', hours: !!p.openingHours?.length, street: !!(p.street || p.address),
       rating: p.totalScore || 0, reviews: p.reviewsCount || 0, maps: p.url || '', city: p.city || '', country, niche});
   }
   const names = [...new Set(cands.map(c => c.city).filter(Boolean))].slice(0, 3);
   return save(await unsaved(cands), niche, country, Math.min(+count || 20, 50), names);
 }
 
-// ---------- write the outreach (email or WhatsApp/DM text) ------------------
+// ---------- SOURCE 2: Geoapify (free key), cached 7 days --------------------
+async function pool(niche, country, city) {
+  const key = 'pool_' + (niche + '_' + city).replace(/\W/g, '');
+  const row = (await db.from('settings').select('value').eq('key', key).maybeSingle()).data?.value;
+  let cached = null;
+  try { cached = row && JSON.parse(row); } catch { /* ignore */ }
+  if (cached?.items?.length && Date.now() - cached.t < 6048e5) return cached.items;
+  const [lat, lon] = CITIES[country][city];
+  try {
+    const r = await fetch(`https://api.geoapify.com/v2/places?categories=${GEO[niche]}&filter=circle:${lon},${lat},${RADIUS}&limit=500&apiKey=${process.env.GEOAPIFY_KEY}`, {signal: AbortSignal.timeout(25000)});
+    if (!r.ok) throw new Error('Geoapify ' + r.status);
+    const items = [];
+    for (const f of (await r.json()).features || []) {
+      const p = f.properties || {}, raw = p.datasource?.raw || {};
+      if (!p.name || p.website || p.contact?.website || raw.website || raw['contact:website'] || raw.url) continue;
+      const phone = p.contact?.phone || p.phone || raw.phone || raw['contact:phone'] || '';
+      const email = (p.contact?.email || p.email || raw.email || raw['contact:email'] || '').toLowerCase();
+      if (!phone && !email) continue;
+      items.push({name: p.name, phone, email, address: p.address_line2 || p.formatted || city, hours: !!(p.opening_hours || raw.opening_hours), street: !!p.street, city, country, niche});
+    }
+    if (items.length) await db.from('settings').upsert({key, value: JSON.stringify({t: Date.now(), items: items.slice(0, 250)})});
+    return items;
+  } catch (e) {
+    if (cached?.items?.length) return cached.items;
+    throw e;
+  }
+}
+async function search({niche, country, city, count}) {
+  if (!process.env.GEOAPIFY_KEY) throw new Error('GEOAPIFY_KEY is not set');
+  const C = CITIES[country];
+  if (!C) throw new Error('Unknown country');
+  if (!GEO[niche]) throw new Error('Custom industries work with the Apify source only. Pick a listed industry.');
+  const names = city && C[city] ? [city] : Object.keys(C).sort(() => Math.random() - 0.5).slice(0, 3);
+  const res = await Promise.allSettled(names.map(c => pool(niche, country, c)));
+  const items = res.flatMap(x => x.status === 'fulfilled' ? x.value : []);
+  const bad = res.find(x => x.status === 'rejected');
+  if (!items.length && bad) throw bad.reason;
+  return save(await unsaved(items), niche, country, Math.min(+count || 20, 50), names);
+}
+
+// ---------- connection test (shown in the UI) -------------------------------
+async function check() {
+  const out = {apify: {set: !!process.env.APIFY_TOKEN}, geo: {set: !!process.env.GEOAPIFY_KEY}};
+  if (out.apify.set) {
+    try {
+      const r = await fetch(`${APIFY}/users/me?token=${process.env.APIFY_TOKEN}`);
+      const j = await r.json().catch(() => ({}));
+      out.apify.ok = r.ok; out.apify.user = j.data?.username || '';
+      if (r.ok) {
+        try {
+          const l = await (await fetch(`${APIFY}/users/me/limits?token=${process.env.APIFY_TOKEN}`)).json();
+          out.apify.used = l.data?.current?.monthlyUsageUsd; out.apify.max = l.data?.limits?.maxMonthlyUsageUsd;
+        } catch { /* usage numbers are optional */ }
+      }
+    } catch { out.apify.ok = false; }
+  }
+  if (out.geo.set) {
+    try { out.geo.ok = (await fetch(`https://api.geoapify.com/v1/geocode/search?text=Berlin&limit=1&apiKey=${process.env.GEOAPIFY_KEY}`)).ok; }
+    catch { out.geo.ok = false; }
+  }
+  return out;
+}
+
+// ---------- manage leads: add / delete / mark -------------------------------
+async function addLead(b) {
+  const name = (b.name || '').trim(), phone = (b.phone || '').trim(), email = (b.email || '').trim().toLowerCase() || null, address = (b.address || '').trim();
+  if (!name) throw new Error('Business name is required');
+  if (!phone && !email) throw new Error('Add a phone number or an email');
+  if (email && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error('That email address looks invalid');
+  const c = {phone, email, street: !!address};
+  const x = await db.from('leads').insert({
+    name, email, company: name, score: score(c), signals: ['Finder', 'Manual'], explanation: 'Added manually', stage: 'new',
+    profile: `Category: ${(b.niche || 'n/a').trim()}\nLocation: ${address}\nWebsite: none\nPhone: ${phone}\nMaps: ${(b.maps || '').trim() || mapsSearch(name, address)}`,
+  }).select().single();
+  if (x.error) throw new Error(/duplicate|unique/i.test(x.error.message) ? 'A lead with this email already exists' : x.error.message);
+  return {lead: x.data};
+}
+async function delLeads({ids}) {
+  if (!Array.isArray(ids) || !ids.length) throw new Error('Nothing selected');
+  await db.from('drafts').delete().in('lead_id', ids);
+  await db.from('messages').delete().in('lead_id', ids);
+  ok(await db.from('leads').delete().in('id', ids));
+  return {deleted: ids.length};
+}
+async function mark({lead_id}) {
+  await db.from('leads').update({stage: 'messaged', last_contact: new Date().toISOString()}).eq('id', lead_id);
+  return {ok: 1};
+}
+
+// ---------- outreach: email draft or WhatsApp text --------------------------
 async function draft({lead_ids, channel}) {
   const out = [];
   for (let i = 0; i < lead_ids.length; i += 3) {
