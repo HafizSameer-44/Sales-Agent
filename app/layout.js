@@ -1,4 +1,12 @@
+// PASTE AS:  app/layout.js   (replace the old file)
 import './globals.css';
-export const metadata={title:'Sales Agent',appleWebApp:{capable:true,title:'Sales Agent'}};
-export const viewport={width:'device-width',initialScale:1};
-export default function L({children}){return <html lang="en"><body>{children}</body></html>}
+
+export const metadata = {
+  title: 'Sales Agent by Greek Root AI',
+  description: 'An AI sales agent that finds real businesses, writes the outreach and tracks every reply.',
+};
+export const viewport = {width: 'device-width', initialScale: 1, themeColor: '#4f46e5'};
+
+export default function RootLayout({children}) {
+  return <html lang="en"><body>{children}</body></html>;
+}
