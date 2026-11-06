@@ -1,5 +1,6 @@
 // PASTE AS:  app/layout.js   (replace the old file)
 import './globals.css';
+import { Analytics } from '@vercel/analytics/next';
 
 export const metadata = {
   title: 'Sales Agent by Greek Root AI',
@@ -8,5 +9,5 @@ export const metadata = {
 export const viewport = {width: 'device-width', initialScale: 1, themeColor: '#4f46e5'};
 
 export default function RootLayout({children}) {
-  return <html lang="en"><body>{children}</body></html>;
+  return <html lang="en"><body>{children}<Analytics /></body></html>;
 }
